@@ -3,260 +3,303 @@ import pandas as pd
 import requests
 import time
 from urllib.parse import quote_plus
-import pulp
 
-st.set_page_config(page_title="DeUna Express | VRP", page_icon="🛵", layout="wide")
+st.set_page_config(
+    page_title="DeUna Express | Planificador de rutas",
+    page_icon="🛵",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 OSRM_TABLE_URL = "https://router.project-osrm.org/table/v1/driving"
-USER_AGENT = "deuna-express-vrp-degree-project/2.0"
+USER_AGENT = "deuna-express-academic-cvrp/2.0"
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def geocode(address):
-    r = requests.get(
-        NOMINATIM_URL,
-        params={"q": address, "format": "jsonv2", "limit": 1, "countrycodes": "co"},
-        headers={"User-Agent": USER_AGENT},
-        timeout=25,
-    )
+def geocode_address(address: str):
+    q = address.strip()
+    if "colombia" not in q.lower():
+        q += ", Fonseca, La Guajira, Colombia"
+    params = {"q": q, "format": "jsonv2", "limit": 1, "countrycodes": "co"}
+    r = requests.get(NOMINATIM_URL, params=params,
+                     headers={"User-Agent": USER_AGENT}, timeout=25)
     r.raise_for_status()
     data = r.json()
     if not data:
         return None
-    return {"lat": float(data[0]["lat"]), "lon": float(data[0]["lon"])}
+    return {
+        "lat": float(data[0]["lat"]),
+        "lon": float(data[0]["lon"]),
+        "display_name": data[0].get("display_name", q)
+    }
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def matrices(coords_tuple):
-    coords = ";".join(f"{lon},{lat}" for lat, lon in coords_tuple)
-    r = requests.get(
-        f"{OSRM_TABLE_URL}/{coords}",
-        params={"annotations": "distance,duration"},
-        timeout=50,
-    )
+def osrm_matrix(coords):
+    coord_text = ";".join(f"{lon},{lat}" for lat, lon in coords)
+    url = f"{OSRM_TABLE_URL}/{coord_text}"
+    r = requests.get(url, params={"annotations": "distance,duration"}, timeout=40)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != "Ok":
-        raise RuntimeError(str(data))
-    d = [[x/1000 for x in row] for row in data["distances"]]
-    t = [[x/60 for x in row] for row in data["durations"]]
-    return d, t
+        raise RuntimeError("No fue posible construir la matriz de rutas.")
+    distances = [[v / 1000 if v is not None else 1e9 for v in row]
+                 for row in data["distances"]]
+    durations = [[v / 60 if v is not None else 1e9 for v in row]
+                 for row in data["durations"]]
+    return distances, durations
 
-def solve_vrp(cost, n, m, limit=60):
-    N = range(1, n+1)
-    V = range(0, n+1)
-    K = range(1, m+1)
+def route_load(route, demands):
+    return sum(demands[i] for i in route if i != 0)
 
-    model = pulp.LpProblem("DeUna_Express_VRP", pulp.LpMinimize)
+def clarke_wright(dist, demands, capacities):
+    """
+    Clarke & Wright paralelo para CVRP.
+    0 = depósito; 1..n = clientes.
+    Se crean rutas unitarias y se fusionan por ahorro descendente,
+    respetando la capacidad máxima disponible.
+    """
+    n = len(demands) - 1
+    routes = [[i] for i in range(1, n + 1)]
+    max_capacity = max(capacities)
 
-    x = {(i,j,k): pulp.LpVariable(f"x_{i}_{j}_{k}", cat="Binary")
-         for k in K for i in V for j in V if i != j}
-    y = {k: pulp.LpVariable(f"y_{k}", cat="Binary") for k in K}
-    u = {i: pulp.LpVariable(f"u_{i}", lowBound=1, upBound=n) for i in N}
+    savings = []
+    for i in range(1, n + 1):
+        for j in range(i + 1, n + 1):
+            s = dist[0][i] + dist[0][j] - dist[i][j]
+            savings.append((s, i, j))
+    savings.sort(reverse=True)
 
-    model += pulp.lpSum(cost[i][j]*x[i,j,k]
-                        for k in K for i in V for j in V if i != j)
+    def locate(customer):
+        for idx, r in enumerate(routes):
+            if customer in r:
+                return idx
+        return None
 
-    for j in N:
-        model += pulp.lpSum(x[i,j,k] for k in K for i in V if i != j) == 1
-
-    for k in K:
-        for h in N:
-            model += (
-                pulp.lpSum(x[i,h,k] for i in V if i != h)
-                ==
-                pulp.lpSum(x[h,j,k] for j in V if j != h)
-            )
-
-    for k in K:
-        model += pulp.lpSum(x[0,j,k] for j in N) == y[k]
-        model += pulp.lpSum(x[i,0,k] for i in N) == y[k]
-
-    model += pulp.lpSum(y[k] for k in K) == m
-
-    for i in N:
-        for j in N:
-            if i != j:
-                model += (
-                    u[i] - u[j]
-                    + n*pulp.lpSum(x[i,j,k] for k in K)
-                    <= n - 1
-                )
-
-    model.solve(pulp.PULP_CBC_CMD(msg=False, timeLimit=limit))
-    status = pulp.LpStatus[model.status]
-
-    routes = []
-    for k in K:
-        if pulp.value(y[k]) is None or pulp.value(y[k]) < 0.5:
+    for _, i, j in savings:
+        ri, rj = locate(i), locate(j)
+        if ri is None or rj is None or ri == rj:
             continue
-        route = [0]
-        current = 0
-        seen = set()
-        for _ in range(n+2):
-            nxt = None
-            for j in V:
-                if current != j and (current,j,k) in x:
-                    v = pulp.value(x[current,j,k])
-                    if v is not None and v > 0.5:
-                        nxt = j
-                        break
-            if nxt is None:
-                break
-            route.append(nxt)
-            if nxt == 0:
-                break
-            if nxt in seen:
-                break
-            seen.add(nxt)
-            current = nxt
-        routes.append((k, route))
+        a, b = routes[ri], routes[rj]
+        if i not in (a[0], a[-1]) or j not in (b[0], b[-1]):
+            continue
+        if route_load(a, demands) + route_load(b, demands) > max_capacity:
+            continue
 
-    return status, pulp.value(model.objective), routes
+        candidates = []
+        if a[-1] == i and b[0] == j:
+            candidates.append(a + b)
+        if a[0] == i and b[-1] == j:
+            candidates.append(b + a)
+        if a[0] == i and b[0] == j:
+            candidates.append(list(reversed(a)) + b)
+        if a[-1] == i and b[-1] == j:
+            candidates.append(a + list(reversed(b)))
+        if not candidates:
+            continue
 
-def route_value(route, matrix):
-    return sum(matrix[a][b] for a,b in zip(route[:-1], route[1:]))
+        merged = candidates[0]
+        for idx in sorted([ri, rj], reverse=True):
+            routes.pop(idx)
+        routes.append(merged)
 
-def maps_link(depot, addresses):
-    return (
-        "https://www.google.com/maps/dir/?api=1"
-        f"&origin={quote_plus(depot)}"
-        f"&destination={quote_plus(depot)}"
-        f"&waypoints={'|'.join(quote_plus(a) for a in addresses)}"
-        "&travelmode=driving"
-    )
+    # Asignación de rutas a motos por capacidad.
+    route_info = [(r, route_load(r, demands)) for r in routes]
+    route_info.sort(key=lambda x: x[1], reverse=True)
+    bikes = sorted([(c, k + 1) for k, c in enumerate(capacities)], reverse=True)
+
+    assigned, unassigned = [], []
+    used = set()
+    for route, load in route_info:
+        options = [(c, k) for c, k in bikes if k not in used and c >= load]
+        if not options:
+            unassigned.append((route, load))
+            continue
+        c, k = min(options, key=lambda x: x[0])
+        used.add(k)
+        assigned.append({"moto": k, "capacidad": c, "ruta": route, "carga": load})
+    return assigned, unassigned
+
+def route_metrics(route, dist, dur):
+    seq = [0] + route + [0]
+    km = sum(dist[seq[i]][seq[i+1]] for i in range(len(seq)-1))
+    minutes = sum(dur[seq[i]][seq[i+1]] for i in range(len(seq)-1))
+    return km, minutes, seq
+
+def maps_link(seq, points):
+    labels = [points[i]["address"] for i in seq]
+    if len(labels) < 2:
+        return ""
+    origin = quote_plus(labels[0])
+    destination = quote_plus(labels[-1])
+    waypoints = quote_plus("|".join(labels[1:-1]))
+    url = f"https://www.google.com/maps/dir/?api=1&origin={origin}&destination={destination}"
+    if waypoints:
+        url += f"&waypoints={waypoints}"
+    return url
 
 st.title("🛵 DeUna Express")
-st.subheader("Optimización de rutas por batch")
-st.caption("Modelo VRP entero-mixto: clientes y motocicletas variables en cada batch.")
+st.subheader("Planificador de rutas de distribución por lotes")
+st.caption(
+    "Prototipo académico basado en un Problema de Ruteo de Vehículos con Capacidad "
+    "(CVRP) y la heurística de ahorros de Clarke & Wright."
+)
 
 with st.sidebar:
-    st.header("Configuración")
+    st.header("Configuración del lote")
     batch = st.text_input("Identificador del batch", "Batch 1")
-    depot = st.text_input("Dirección del depósito")
-    motos = st.number_input("Motocicletas a utilizar", min_value=1, max_value=30, value=2)
-    criterio = st.selectbox("Criterio", ["Menor tiempo total", "Menor distancia total"])
-    limite = st.selectbox("Tiempo máximo de cálculo", [30,60,120], index=1)
+    bloque = st.selectbox("Bloque de operación",
+                          ["Matutino", "Mediodía", "Vespertino"])
+    depot = st.text_input(
+        "Dirección del depósito",
+        placeholder="Escriba la dirección de la sede en Fonseca"
+    )
+    motos = st.number_input("Motocicletas disponibles", min_value=1,
+                            max_value=30, value=3, step=1)
+    st.markdown("**Capacidad por motocicleta (pedidos)**")
+    capacities = []
+    for k in range(int(motos)):
+        capacities.append(
+            int(st.number_input(f"Moto {k+1}", min_value=1, max_value=100,
+                                value=10, step=1, key=f"cap_{k}"))
+        )
+    st.info("Criterio del trabajo de grado: menor distancia total.")
 
-st.markdown("## Pedidos del batch")
-df0 = pd.DataFrame({
-    "Pedido": ["P001","P002","P003","P004"],
-    "Cliente": ["","","",""],
-    "Dirección": ["","","",""]
+st.header("Pedidos del batch")
+st.write("Ingrese un cliente por fila. La demanda corresponde al número de pedidos o unidades de capacidad asignadas a ese cliente.")
+
+default = pd.DataFrame({
+    "Pedido": ["P001", "P002", "P003", "P004"],
+    "Cliente": ["", "", "", ""],
+    "Dirección": ["", "", "", ""],
+    "Demanda": [1, 1, 1, 1]
 })
-orders = st.data_editor(df0, num_rows="dynamic", hide_index=True, use_container_width=True)
 
-if st.button("🚀 Optimizar rutas", type="primary", use_container_width=True):
-    df = orders.copy()
-    for c in ["Pedido","Cliente","Dirección"]:
-        df[c] = df[c].fillna("").astype(str).str.strip()
-    df = df[(df["Pedido"]!="") & (df["Dirección"]!="")].reset_index(drop=True)
+orders = st.data_editor(
+    default,
+    num_rows="dynamic",
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "Pedido": st.column_config.TextColumn("Pedido"),
+        "Cliente": st.column_config.TextColumn("Cliente"),
+        "Dirección": st.column_config.TextColumn("Dirección"),
+        "Demanda": st.column_config.NumberColumn(
+            "Demanda", min_value=1, step=1, default=1
+        )
+    }
+)
 
-    n = len(df)
-    m = int(motos)
+if st.button("🚀 Generar rutas optimizadas", type="primary", use_container_width=True):
+    clean = orders.copy()
+    clean["Dirección"] = clean["Dirección"].fillna("").astype(str).str.strip()
+    clean = clean[clean["Dirección"] != ""].reset_index(drop=True)
 
     if not depot.strip():
         st.error("Ingrese la dirección del depósito.")
         st.stop()
-    if n == 0:
-        st.error("Ingrese al menos un pedido.")
+    if clean.empty:
+        st.error("Ingrese al menos una dirección de cliente.")
         st.stop()
-    if m > n:
-        st.error("No puede utilizar más motocicletas que clientes en este modelo.")
+    if clean["Demanda"].fillna(1).sum() > sum(capacities):
+        st.error(
+            f"La demanda total ({int(clean['Demanda'].fillna(1).sum())}) supera "
+            f"la capacidad total disponible ({sum(capacities)})."
+        )
         st.stop()
 
-    with st.status("Procesando...", expanded=True) as status_box:
-        st.write("Geocodificando depósito y clientes...")
-        p0 = geocode(depot)
-        if p0 is None:
-            st.error("No fue posible localizar el depósito.")
+    with st.spinner("Geocodificando direcciones y construyendo la matriz de distancias..."):
+        points = []
+        dep = geocode_address(depot)
+        if not dep:
+            st.error("No fue posible localizar el depósito. Revise la dirección.")
+            st.stop()
+        points.append({"address": depot, **dep})
+
+        failed = []
+        for idx, row in clean.iterrows():
+            g = geocode_address(row["Dirección"])
+            if not g:
+                failed.append(row["Dirección"])
+            else:
+                points.append({"address": row["Dirección"], **g})
+            time.sleep(1)
+
+        if failed:
+            st.error("No fue posible localizar: " + "; ".join(failed))
             st.stop()
 
-        points = [p0]
-        for _, row in df.iterrows():
-            addr = row["Dirección"]
-            if "riohacha" not in addr.lower():
-                addr += ", Riohacha, La Guajira, Colombia"
-            p = geocode(addr)
-            if p is None:
-                st.error(f"No fue posible localizar: {row['Dirección']}")
-                st.stop()
-            points.append(p)
-            time.sleep(1.05)
+        coords = [(p["lat"], p["lon"]) for p in points]
+        try:
+            dist, dur = osrm_matrix(coords)
+        except Exception as e:
+            st.error(f"No fue posible calcular la matriz de recorridos: {e}")
+            st.stop()
 
-        st.write("Generando matrices automáticas...")
-        coords = tuple((round(p["lat"],7), round(p["lon"],7)) for p in points)
-        dist, dur = matrices(coords)
+    demands = [0] + [int(v) for v in clean["Demanda"].fillna(1).tolist()]
+    assigned, unassigned = clarke_wright(dist, demands, capacities)
 
-        cost = dur if criterio == "Menor tiempo total" else dist
-        unit = "min" if criterio == "Menor tiempo total" else "km"
+    if unassigned:
+        st.warning(
+            "La heurística no pudo asignar todas las rutas a la flota con las "
+            "capacidades indicadas. Revise las capacidades o aumente el número de motos."
+        )
 
-        st.write("Resolviendo el modelo matemático VRP...")
-        solver_status, objective, routes = solve_vrp(cost, n, m, int(limite))
-        status_box.update(label="Optimización finalizada", state="complete")
+    st.success(f"Rutas generadas para {batch} – {bloque}")
 
-    if not routes:
-        st.error(f"No se obtuvieron rutas. Estado: {solver_status}")
-        st.stop()
+    total_km, total_min = 0.0, 0.0
+    result_rows = []
 
-    st.markdown(f"## Resultado — {batch}")
-    a,b,c,d = st.columns(4)
-    a.metric("Clientes", n)
-    b.metric("Motocicletas", m)
-    c.metric("Estado", solver_status)
-    d.metric("Función objetivo", f"{objective:.2f} {unit}" if objective is not None else "N/D")
+    for item in sorted(assigned, key=lambda x: x["moto"]):
+        km, minutes, seq = route_metrics(item["ruta"], dist, dur)
+        total_km += km
+        total_min += minutes
+        customer_names = []
+        for node in item["ruta"]:
+            row = clean.iloc[node - 1]
+            name = str(row["Cliente"]).strip()
+            customer_names.append(name if name else str(row["Pedido"]))
 
-    total_d = 0
-    total_t = 0
+        st.markdown(f"### 🛵 Moto {item['moto']}")
+        st.write("**Secuencia:** Depósito → " + " → ".join(customer_names) + " → Depósito")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Carga", f"{item['carga']} pedidos")
+        c2.metric("Capacidad", f"{item['capacidad']} pedidos")
+        c3.metric("Distancia", f"{km:.2f} km")
+        c4.metric("Tiempo estimado", f"{minutes:.1f} min")
+        st.markdown(f"[Abrir recorrido en Google Maps]({maps_link(seq, points)})")
 
-    for k, route in routes:
-        clients = [node for node in route if node != 0]
-        rows = [df.iloc[node-1] for node in clients]
-        rd = route_value(route, dist)
-        rt = route_value(route, dur)
-        total_d += rd
-        total_t += rt
+        result_rows.append({
+            "Moto": item["moto"],
+            "Ruta": "Depósito → " + " → ".join(customer_names) + " → Depósito",
+            "Carga": item["carga"],
+            "Capacidad": item["capacidad"],
+            "Distancia (km)": round(km, 2),
+            "Tiempo estimado (min)": round(minutes, 1)
+        })
 
-        with st.container(border=True):
-            st.markdown(f"### Motocicleta {k}")
-            st.write(" → ".join(["Depósito"] + [str(r["Pedido"]) for r in rows] + ["Depósito"]))
-            c1,c2,c3 = st.columns(3)
-            c1.metric("Clientes asignados", len(rows))
-            c2.metric("Distancia", f"{rd:.2f} km")
-            c3.metric("Tiempo", f"{rt:.1f} min")
+    st.divider()
+    st.subheader("Resumen del batch")
+    a, b, c, d = st.columns(4)
+    a.metric("Clientes", len(clean))
+    b.metric("Motos utilizadas", len(assigned))
+    c.metric("Distancia total", f"{total_km:.2f} km")
+    d.metric("Tiempo acumulado estimado", f"{total_min:.1f} min")
 
-            detail = pd.DataFrame({
-                "Orden": range(1, len(rows)+1),
-                "Pedido": [r["Pedido"] for r in rows],
-                "Cliente": [r["Cliente"] for r in rows],
-                "Dirección": [r["Dirección"] for r in rows],
-            })
-            st.dataframe(detail, hide_index=True, use_container_width=True)
-            st.link_button("Abrir ruta en Google Maps",
-                           maps_link(depot, [r["Dirección"] for r in rows]),
-                           use_container_width=True)
+    if result_rows:
+        results = pd.DataFrame(result_rows)
+        st.dataframe(results, use_container_width=True, hide_index=True)
+        st.download_button(
+            "⬇️ Descargar resultados CSV",
+            results.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"{batch.replace(' ', '_')}_rutas.csv",
+            mime="text/csv"
+        )
 
-    st.markdown("### Indicadores globales")
-    q1,q2 = st.columns(2)
-    q1.metric("Distancia total", f"{total_d:.2f} km")
-    q2.metric("Tiempo total acumulado", f"{total_t:.1f} min")
-
-    st.markdown("### Mapa")
-    st.map(pd.DataFrame({"lat":[p["lat"] for p in points],
-                         "lon":[p["lon"] for p in points]}),
-           use_container_width=True)
-
-    with st.expander("Ver matriz generada automáticamente"):
-        labels = ["Depósito"] + df["Pedido"].tolist()
-        mat = pd.DataFrame(cost, index=labels, columns=labels)
-        st.dataframe(mat.round(1 if unit=="min" else 2), use_container_width=True)
-
-    with st.expander("Ver formulación matemática implementada"):
-        st.latex(r"\min Z=\sum_{k\in K}\sum_{i\in V}\sum_{j\in V,\ j\neq i} c_{ij}x_{ijk}")
-        st.markdown("""
-- Cada cliente se visita exactamente una vez.
-- Se conserva el flujo en cada cliente para cada motocicleta.
-- Cada motocicleta utilizada sale y regresa al depósito.
-- Se utilizan exactamente las motocicletas indicadas para el batch.
-- Se eliminan subrutas mediante restricciones MTZ.
-- `c_ij` corresponde a tiempo o distancia según el criterio seleccionado.
-        """)
+    with st.expander("Metodología implementada"):
+        st.write(
+            "La aplicación representa cada lote como una instancia estática de CVRP. "
+            "Las direcciones se geocodifican, se obtiene una matriz de distancias y "
+            "tiempos de viaje por red vial y se aplica la heurística de ahorros de "
+            "Clarke & Wright. Las fusiones de rutas se aceptan únicamente cuando "
+            "respetan la capacidad disponible de las motocicletas."
+        )
